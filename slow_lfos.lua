@@ -8,8 +8,8 @@ local periods = {1.1, 10.7, 97.3, 1031.9}
 function init()
     for i = 1, 4 do
         output[i].action = loop{
-            to(5, periods[i] / 2, 'sine'),
-            to(0, periods[i] / 2, 'sine')
+            to(5, periods[i] / 2, 'linear'),
+            to(0, periods[i] / 2, 'linear')
         }
         output[i]()
     end
