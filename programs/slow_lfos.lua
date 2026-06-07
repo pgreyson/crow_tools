@@ -1,5 +1,7 @@
+-- requires:
 --- slow_lfos
--- 4 non-repeating LFOs across orders of magnitude
+-- 4 non-repeating LFOs across orders of magnitude. Standalone: no modules,
+-- no clock -- free-running ASL loops at wall-clock prime periods.
 -- output 1: ~1s, output 2: ~10s, output 3: ~100s, output 4: ~1000s
 -- prime-based periods ensure the pattern never repeats
 
