@@ -95,14 +95,31 @@ function cv_off()
   output[2].volts = 0; output[3].volts = 0; output[4].volts = 0
   print('cv off')
 end
-function cv_in(b)
+-- Input 1: live scalar control of sieve gate duration.
+-- Maps -5..+5V exponentially to 0.1x..10x duration_scale (1.0x at 0V).
+-- Final per-hit gate length = duration_scale * (gate_base + gate_slope * pitch_volts).
+function duration_cv(b)
   if b then
-    input[1].mode('stream', 0.5)
-    input[1].stream = function(v) clk:map_volts(v) end
-    print('cv_in: input 1 -> clock rate (sampled at 2 Hz)')
+    input[1].mode('stream', 0.1)
+    input[1].stream = function(v) sv:set_duration_scale(2 ^ (v / 1.66)) end
+    print('duration_cv: input 1 -> sieve duration scale (10Hz sampling)')
   else
     input[1].mode('none')
-    print('cv_in: input 1 disabled')
+    sv:set_duration_scale(1.0)
+    print('duration_cv: input 1 disabled, scale reset to 1.0')
+  end
+end
+
+-- Input 2: tempo CV → master clock rate.
+-- Same map_volts as before: -5..+5V → 0.25..32 Hz exponential, 4Hz at 0V.
+function tempo_cv(b)
+  if b then
+    input[2].mode('stream', 0.5)
+    input[2].stream = function(v) clk:map_volts(v) end
+    print('tempo_cv: input 2 -> clock rate (sampled at 2 Hz)')
+  else
+    input[2].mode('none')
+    print('tempo_cv: input 2 disabled')
   end
 end
 
@@ -117,7 +134,8 @@ function scale(s)       sv:set_scale(s) end
 function octaves(n)     sv:set_octaves(n) end
 function root(v)        sv:set_root(v) end
 function invert(b)      sv.invert = b end
-function gate_ms(n)     sv.gate_ms = n end
+function gate_base(s)   sv:set_gate_base(s) end
+function gate_slope(s)  sv:set_gate_slope(s) end
 function reset_step()   sv:reset() end
 
 -- ============== triangle =============================================

@@ -64,11 +64,22 @@ wtape rack's `DEFAULT_PORT` if present, else auto-detects a crow by VID:PID
 - **Avoid global names that shadow ASL primitives:** `loop`, `to`, `held`,
   `times`, `lfo`, `pulse`, `wait`, `here`. (We renamed our tape-loop
   helper to `looplen` for this reason.)
+- **crow Lua numbers are 32-BIT (float32 + int32).** The GLSL-style hash
+  `frac(bigconstant * x)` silently returns ~0 — float32 has 24 mantissa
+  bits, so the fractional part of ~1e7 is gone. Symptom: every stochastic
+  draw degenerates (all residues active, empty sampled sets). Use integer
+  LCG hashes with intermediates < 2^31 (see `modules/sieve_terms.lua`).
+- **Sustained Lua wakeup rates ≥ ~50 Hz overflow the event queue.** A
+  100 Hz `clock.sleep` tick loop + two 20 Hz input streams killed the
+  REPL until power-cycle (2026-08-14). Keep tick loops ≤ ~16 Hz and input
+  `mode('stream', dt)` at dt ≥ 0.2. Programs whose `init()` starts nothing
+  recover with a plain power-cycle — one more reason for that rule.
 
 ## Tape state recovery cheat sheet
 
 | Symptom | Cause | Fix |
 |---|---|---|
+| crow REPL silent to OUR probes — **check druid FIRST** | macOS lets multiple processes open `/dev/cu.*` simultaneously: druid doesn't block our open, it just consumes the crow's replies, perfectly mimicking a dead runtime (bit us 2026-08-14) | Ask the user to quit druid, re-probe before diagnosing anything deeper |
 | crow REPL silent, `^^v` works | Lua VM stuck or in upload-buffer mode | `^^e` then `^^c` |
 | crow REPL silent, `^^v` silent too | Event-queue overflow from running script | `^^k` (kill Lua), then `^^c`. Hardware i2c jumper if those don't land. |
 | Tape transport not advancing despite `record=1, play=1` | Recent `WARNING_clear_tape` not finished | Power-cycle eurorack case. Wait ≥30 s after clears in future. |

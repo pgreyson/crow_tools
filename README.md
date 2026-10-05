@@ -105,6 +105,71 @@ Each w/tape has its own L/R audio inputs on the panel. i2c carries control
 only. To capture stereo across both tapes you need two audio cables (or a
 stackcable / Y-split from a single source).
 
+## crow_sim — run programs without the crow
+
+`python3 crow_sim.py [program]` (default `sieve_dual`) loads the SAME built
+source deploy.py flashes into a local Lua 5.4 VM (`pip install --user lupa`)
+and serves a browser UI at http://localhost:8777: sliders for every sieve
+parameter (calling the program's real druid functions), in1/in2 CV voltage
+sliders, a time-scale multiplier (audition a 10-min cycle in seconds), live
+CV traces (pitch/gate/saw), and the sieve_viz visualizations driven by the
+program's own `dump()`.
+
+Shimmed API surface: `output[n].volts`, `input[n].mode('stream')/.stream`,
+`clock.run/sleep/cancel`, `print`. NOT simulated: ASL (`output[n].action`),
+`metro`, `ii` — using them raises "not simulated". Stochastic draws are
+bit-exact vs hardware (integer hash); float math is float64 here vs the
+crow's float32, so timing/CV differ only in the last decimals. The sim never
+opens serial — with ONE exception: the UI's "→ crow" button batch-pushes the
+current param state to the hardware as druid commands (scale, registers,
+root, gate_ratio, pitch_span, all dset/pset keys — NOT rate/cycle, which
+come from rack CV), following the serial safety rules, single pass, aborts
+if the crow doesn't echo (druid open).
+
+`python3 test_sim.py` is the parameter-effect suite: every control exercised
+through the sim in deterministic step mode, gate patterns printed as
+inspectable strips (`x` onset, `-` held, `.` rest), 21 assertions.
+
+## sieve_dual (video rack) — control reference
+
+The video crow runs `programs/sieve_dual.lua`: two independent Xenakis
+sieves — DURATION (rhythm: its member gaps are the note lengths) and PITCH
+(its member values index a Scala scale). Moduli for each are sampled from a
+hierarchical Gaussian-mixture distribution over the modulus axis; residues
+from a von-Mises density/concentration/seed distribution. Boots idle.
+
+**CV in:** in1 = rate (absolute event density, exp 0.05→16 Hz — notes/sec ≈
+rate × dur density, independent of cycle). in2 = cycle (wall-clock pattern
+length AND out3 saw period, exp 0.05 s→24 h).
+
+**Out:** 1 = pitch (V/oct), 2 = gate (width = duration × `gate_ratio`),
+3 = saw −5→+5 V period = cycle, 4 = free.
+
+**druid:**
+
+```
+start()  stop()  status()  dump()
+scale_list()          -- chromatic major_ji pentatonic bohlen_pierce ed19 ed32 harm32
+                      --   penta_cluster (5 just-penta cores x 5 microtones +/-40c)
+scale('harm32')
+dset(key, v)          -- duration-sieve distribution;  pset(key, v) -- pitch sieve
+  'center'    where the moduli distribution sits (rhythm/melody timescale)
+  'spread'    how widely sampled peak centers scatter (log ratio)
+  'n_peaks'   Gaussian components in the mixture
+  'width'     peak width (overlapping lumps <-> sharp spikes)
+  'dominance' 0 = equal peaks, 1 = one big + little ones
+  'terms'     how many moduli drawn from the mixture
+  'density'   fraction of residue classes firing (fullness)
+  'conc'      residues clustered <-> even
+  'seed'      re-rolls the cascade (deterministic)
+pitch_span(n)  registers(n)  root(v)  gate_ratio(r)
+rate_hz(hz)  cycle_s(s)  speed_v(v)  cycle_v(v)   -- test without patched CV
+```
+
+`python3 sieve_viz.py` fetches `dump()` and renders the terms as text
+notation + an SVG page (distribution, residue rings, onset strip, pitch
+contour). Close druid first — it eats the crow's replies.
+
 ## Deploying
 
 ```bash
