@@ -62,6 +62,13 @@ def strip(sim, seconds, chars=72):
 def onsets(s): return s.count('x')
 
 def pitch_set(sim, seconds):
+    """Landed pitch targets: glide off (and in-flight ramps orphaned) so
+    ch1 carries one write per note, not slew intermediates. in2 CV owns the
+    glide range now, so pin it low AND apply immediately."""
+    sim.in_volts[2] = -5.0
+    sim.call('glide_v', -5.0)
+    for ch in sim.ramp_ver:
+        sim.ramp_ver[ch] += 1
     mark = len(sim.traces[1])
     sim.advance(seconds)
     return [v for _, v in sim.traces[1][mark:]]
@@ -75,10 +82,10 @@ ra = onsets(sa) / max(1, len(sa)) * sta['rate']
 rb = onsets(sb) / max(1, len(sb)) * stb['rate']
 check("rate raises notes/sec", rb > ra * 1.5, f"{ra:.2f} vs {rb:.2f}")
 
-print("== cycle (in2 CV): span tracks rate*cycle ==")
-a = fresh(cv2=-2.0); _, sta = strip(a, 5)
-b = fresh(cv2=2.0);  _, stb = strip(b, 5)
-print(f"  cv2=-2V: cycle={sta['cycle']:.1f}s span={sta['span']}   cv2=+2V: cycle={stb['cycle']:.1f}s span={stb['span']}")
+print("== cycle (druid cycle_s): span tracks rate*cycle ==")
+a = fresh(calls=[('cycle_s', [30])]);  _, sta = strip(a, 5)
+b = fresh(calls=[('cycle_s', [240])]); _, stb = strip(b, 5)
+print(f"  cycle_s(30): cycle={sta['cycle']:.1f}s span={sta['span']}   cycle_s(240): cycle={stb['cycle']:.1f}s span={stb['span']}")
 check("cycle changes span", stb['span'] > sta['span'] * 2)
 
 print("== timescale: host time_scale accelerates virtual time (threaded) ==")
@@ -210,7 +217,22 @@ print("== push_commands: batch reproduces the full param state ==")
 st = fresh().dump_state()
 cmds = push_commands(st)
 print("  " + "\n  ".join(cmds[:6]) + f"\n  ... ({len(cmds)} total)")
-check("push covers all params", len(cmds) == 5 + 18 and any("dset('center'" in c for c in cmds))
+check("push covers all params", len(cmds) == 6 + 2 + 27
+      and any("sset('center'" in c for c in cmds)
+      and any(c.startswith('slew_shapes(') for c in cmds))
+
+print("== glide CV (in2): 0 V = sieve glides, -5 V = stepped ==")
+a = fresh()                                     # in2 at 0 V -> range 0..1
+ma = len(a.traces[1]); a.advance(30.0)
+na = len(a.traces[1]) - ma
+b = fresh(cv2=-5.0)                             # stepped: min=max=0
+mb = len(b.traces[1]); b.advance(30.0)
+nb = len(b.traces[1]) - mb
+print(f"  ch1 writes over 30 s — gliding: {na}   stepped: {nb}")
+check("glide CV gates glides", na > nb * 2, f"{na} vs {nb}")
+mono = [v for _, v in a.traces[1][ma:ma + 6]]
+check("glide is gradual", all(abs(y - x) < 1.0 for x, y in zip(mono, mono[1:])),
+      f"first deltas {[round(y - x, 2) for x, y in zip(mono, mono[1:])]}")
 
 print(f"\n{PASS} passed, {len(FAIL)} failed" + (f": {FAIL}" if FAIL else ""))
 sys.exit(1 if FAIL else 0)

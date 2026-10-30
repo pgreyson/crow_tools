@@ -120,10 +120,17 @@ def parse_dump_lines(text_lines):
         return dict(center=float(c), spread=float(sp), n_peaks=int(k), width=float(w),
                     dominance=float(dom), terms=int(t), density=float(den),
                     conc=float(cc), seed=float(sd))
-    return dict(rate=float(d1[0]), cycle=float(d1[1]), scale=d1[2], registers=int(d1[3]),
-                root=float(d1[4]), gate_ratio=float(d1[5]), span=int(d1[6]),
-                pitch_span=int(d1[7]), step=int(d1[8]), pitch_i=int(d1[9]),
-                saw=float(d1[10]), dur=sieve(lines['DUMP2']), pitch=sieve(lines['DUMP3']))
+    st = dict(rate=float(d1[0]), cycle=float(d1[1]), scale=d1[2], registers=int(d1[3]),
+              root=float(d1[4]), gate_ratio=float(d1[5]), span=int(d1[6]),
+              pitch_span=int(d1[7]), step=int(d1[8]), pitch_i=int(d1[9]),
+              saw=float(d1[10]), dur=sieve(lines['DUMP2']), pitch=sieve(lines['DUMP3']))
+    if 'DUMP4' in lines:            # slew sieve (older builds don't emit it)
+        d4 = lines['DUMP4']
+        st['slew'] = sieve(d4[:9])
+        st['slew_span'] = int(d4[9])
+        st['slew_min'], st['slew_max'] = float(d4[10]), float(d4[11])
+        st['slew_shapes'] = d4[12].split(',') if len(d4) > 12 else ['sine']
+    return st
 
 def fetch(port):
     import serial

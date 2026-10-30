@@ -31,6 +31,17 @@ import sieve_viz
 
 PORT = 8777
 
+# Shape curves for slewed output writes (viz-grade approximations of crow's
+# ASL shapes; unknown names fall back to linear).
+_SHAPES = {
+    'linear':      lambda u: u,
+    'sine':        lambda u: 0.5 - 0.5 * math.cos(math.pi * u),
+    'logarithmic': lambda u: u ** 0.5,
+    'exponential': lambda u: u ** 2.0,
+    'now':         lambda u: 1.0,
+    'wait':        lambda u: 0.0 if u < 1.0 else 1.0,
+}
+
 # ---------------- crow API shim + scheduler ----------------------------------
 
 class Sim:
@@ -42,6 +53,9 @@ class Sim:
         self.running = True
         self.console = []            # (vtime, line)
         self.traces = {n: [] for n in (1, 2, 3, 4)}   # ch -> [(vtime, volts)]
+        self.out_slew = {n: 0.0 for n in (1, 2, 3, 4)}
+        self.out_shape = {n: 'linear' for n in (1, 2, 3, 4)}
+        self.ramp_ver = {n: 0 for n in (1, 2, 3, 4)}  # guards stale ramp samples
         self.in_volts = {1: 0.0, 2: 0.0}
         self.in_stream = {1: None, 2: None}           # (period, lua callback)
         self.in_ver = {1: 0, 2: 0}                    # guards stale feed loops
@@ -74,10 +88,14 @@ class Sim:
               local t = setmetatable({}, {
                 __index = function(_, k)
                   if k == 'volts' then return _sim_get_out(i) end
+                  if k == 'slew' then return _sim_get_slew(i) end
+                  if k == 'shape' then return _sim_get_shape(i) end
                   error('output.'..tostring(k)..' not simulated')
                 end,
                 __newindex = function(_, k, v)
                   if k == 'volts' then _sim_set_out(i, v)
+                  elseif k == 'slew' then _sim_set_slew(i, v)
+                  elseif k == 'shape' then _sim_set_shape(i, v)
                   elseif k == 'action' then error('ASL not simulated')
                   else error('output.'..tostring(k)..' not simulated') end
                 end })
@@ -128,6 +146,10 @@ class Sim:
         """)
         g._sim_set_out = lambda ch, v: sim._set_out(int(ch), float(v))
         g._sim_get_out = lambda ch: (sim.traces[int(ch)][-1][1] if sim.traces[int(ch)] else 0.0)
+        g._sim_set_slew = lambda ch, v: sim.out_slew.__setitem__(int(ch), max(0.0, float(v)))
+        g._sim_get_slew = lambda ch: sim.out_slew[int(ch)]
+        g._sim_set_shape = lambda ch, v: sim.out_shape.__setitem__(int(ch), str(v))
+        g._sim_get_shape = lambda ch: sim.out_shape[int(ch)]
         g._sim_get_in = lambda ch: sim.in_volts[int(ch)]
         g._sim_in_mode = lambda ch, mode, dt: sim._in_mode(int(ch), str(mode), float(dt))
         g._sim_in_stream = lambda ch, fn: sim._in_set_stream(int(ch), fn)
@@ -139,8 +161,22 @@ class Sim:
 
     def _set_out(self, ch, v):
         tr = self.traces[ch]
-        tr.append((self.vtime, v))
-        del tr[:-2400]
+        self.ramp_ver[ch] += 1          # supersede any in-flight ramp
+        slew = self.out_slew[ch]
+        cur = tr[-1][1] if tr else 0.0
+        if slew > 0.01 and abs(v - cur) > 1e-6:
+            # render the glide as scheduled samples (step plot -> staircase
+            # approximating the curve); a mid-ramp write orphans the rest
+            shape = _SHAPES.get(self.out_shape[ch], _SHAPES['linear'])
+            n = min(32, max(2, int(slew / 0.05)))
+            ver = self.ramp_ver[ch]
+            for k in range(1, n + 1):
+                u = k / n
+                self._push(self.vtime + slew * u, 'ramp',
+                           (ch, ver, cur + (v - cur) * shape(u)))
+        else:
+            tr.append((self.vtime, v))
+            del tr[:-2400]
 
     def _in_mode(self, ch, mode, dt):
         self.in_ver[ch] += 1
@@ -168,6 +204,13 @@ class Sim:
                     self._push(self.vtime + max(0.001, float(res)), 'coro', cid)
                 except (TypeError, ValueError):
                     pass
+        elif kind == 'ramp':
+            ch, ver, v = payload
+            if ver != self.ramp_ver[ch]:
+                return                                   # superseded mid-glide
+            tr = self.traces[ch]
+            tr.append((self.vtime, v))
+            del tr[:-2400]
         elif kind == 'input':
             ch, ver = payload
             if ver != self.in_ver[ch]:
@@ -229,13 +272,22 @@ class Sim:
 
 def push_commands(st):
     """druid command lines reproducing the sim's current param state on the
-    crow. rate/cycle are NOT sent — on hardware those come from rack CV."""
+    crow. rate and glide (slew min/max/shape-center) are NOT sent — on
+    hardware those come from rack CV (in1/in2)."""
     cmds = [f"scale('{st['scale']}')",
             f"registers({st['registers']})",
             f"root({st['root']:.3f})",
             f"gate_ratio({st['gate_ratio']:.2f})",
-            f"pitch_span({st['pitch_span']})"]
-    for fn, p in (('dset', st['dur']), ('pset', st['pitch'])):
+            f"pitch_span({st['pitch_span']})",
+            f"cycle_s({st['cycle']:g})"]
+    if 'slew' in st:
+        cmds.append(f"slew_span({st['slew_span']})")
+        shapes = ', '.join(f"'{s}'" for s in st.get('slew_shapes', ['sine']))
+        cmds.append(f"slew_shapes({shapes})")
+    sieves = [('dset', st['dur']), ('pset', st['pitch'])]
+    if 'slew' in st:
+        sieves.append(('sset', st['slew']))
+    for fn, p in sieves:
         for k in ('center', 'spread', 'n_peaks', 'width', 'dominance',
                   'terms', 'density', 'conc', 'seed'):
             if k in p:
@@ -294,7 +346,8 @@ PAGE = """<!doctype html><meta charset="utf-8"><title>crow_sim</title>
 <script>
 const S=[ // label, fn, args-prefix, min, max, step, initial
  ['in1 rate CV (V)','cv',[1],-5,5,0.01,0],
- ['in2 cycle CV (V)','cv',[2],-5,5,0.01,0],
+ ['in2 glide CV (V)','cv',[2],-5,5,0.01,0],
+ ['cycle (s)','cycle_s',[],5,3600,5,600],
  ['time scale','timescale',[],1,60,1,1],
  ['dur center','dset',['center'],2,48,0.5,10],
  ['dur spread','dset',['spread'],0,1.5,0.01,0.5],
@@ -318,6 +371,16 @@ const S=[ // label, fn, args-prefix, min, max, step, initial
  ['root (V)','root',[],-3,3,0.05,0],
  ['gate ratio','gate_ratio',[],0.05,1,0.01,0.6],
  ['pitch span','pitch_span',[],8,256,1,64],
+ ['slew center','sset',['center'],2,32,0.5,7],
+ ['slew spread','sset',['spread'],0,1.5,0.01,0.5],
+ ['slew peaks','sset',['n_peaks'],1,6,1,2],
+ ['slew width','sset',['width'],0.02,1,0.01,0.25],
+ ['slew dominance','sset',['dominance'],0,1,0.01,0.4],
+ ['slew terms','sset',['terms'],1,8,1,3],
+ ['slew density','sset',['density'],0,1,0.01,0.5],
+ ['slew conc','sset',['conc'],0,1,0.01,0],
+ ['slew seed','sset',['seed'],0,1,0.001,0],
+ ['slew span','slew_span',[],8,256,1,48],
 ];
 const sl=document.getElementById('sliders');
 for(const [label,fn,pre,mn,mx,st,init] of S){

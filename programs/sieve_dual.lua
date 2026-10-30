@@ -10,13 +10,23 @@
 --   PITCH sieve -> melody. Its member VALUES index a selectable Scala scale:
 --     degree = value % count, register = value // count. The wrap around the
 --     scale size is what makes the line move instead of just climbing.
+--   SLEW sieve -> glide. Per note, its member value sets the slew-function
+--     parameters on out 1: time (as a RATIO of that note's duration, so it
+--     scales with rate/cycle — 0 = snap, 1 = the whole note is one morph)
+--     and shape (value indexes slew_shapes; one entry = fixed shape).
 --
 -- Controlled by CV from the rack; outputs feed OWL -> bridge -> OBS shaders.
 -- clock.run only (dt can exceed metro's ~18 s cap). init() stages; call start().
 --
 --   in 1  : rate   CV  -> ABSOLUTE event density (ticks/sec, exp 0.05..100 Hz;
 --                         notes/sec ~= rate * dur.density, cycle-independent)
---   in 2  : cycle  CV  -> wall time, exponential 0.05 s .. 24 h
+--   in 2  : glide  CV  -> ONE knob, BOTH slew params. Sets the RANGE the slew
+--                         sieve plays within: -5 V = min/max 0 (stepped),
+--                         0 V = 0..1 (sieve's full choice), +5 V = 1..2
+--                         (all notes morph, long glides overlap/retarget).
+--                         Also centers the shape palette (snappy->smooth);
+--                         each note's sieve value jitters +-1 around it.
+--                         (cycle moved to druid: cycle_s(secs), default 600)
 --   out 1 : pitch (V/oct, quantized to the current scale)
 --   out 2 : gate  (per note, gate_ratio of the duration)
 --   out 3 : slow -5/+5 sawtooth, period = cycle length
@@ -25,7 +35,7 @@
 -- Scale + sieve-shape params are druid setters (see bottom).
 
 local S = {
-  cycle   = 60.0,       -- s, wall-clock length of one full pass (from cycle CV)
+  cycle   = 600.0,      -- s, wall-clock length of one full pass (druid cycle_s)
   -- Moduli are SAMPLED from a hierarchical distribution (sample_moduli):
   -- K peak centers drawn from a lognormal landscape (center, spread), each
   -- with a drawn weight (`dominance` skews toward one-big-peak-plus-little-
@@ -35,12 +45,21 @@ local S = {
             dominance = 0.5, terms = 4, density = 0.35, conc = 0.0, seed = 0.0 },
   pitch = { center = 5,  spread = 0.5, n_peaks = 2, width = 0.25,
             dominance = 0.3, terms = 3, density = 0.5, conc = 0.3, seed = 0.0 },
+  slew  = { center = 7,  spread = 0.5, n_peaks = 2, width = 0.25,
+            dominance = 0.4, terms = 3, density = 0.5, conc = 0.0, seed = 0.0 },
   rate = 2.0,           -- ticks/sec — ABSOLUTE density (from in1 CV): notes/sec
                         -- ~= rate * dur.density, independent of cycle length
   pitch_span = 64,      -- pitch sieve period; > scale count so values wrap
   registers = 2,        -- how many scale periods (octaves) the melody spans
   root = 0.0,
   gate_ratio = 0.6,
+  slew_span = 48,       -- slew sieve period; values normalize over it
+  slew_min = 0.0,       -- glide-time ratio of note duration at value 0
+  slew_max = 1.0,       -- ... at value slew_span-1
+  slew_shapes = { 'logarithmic', 'linear', 'sine' },
+                        -- ORDERED palette, snappy -> smooth: glide CV centers
+                        -- it, per-note sieve value jitters +-1 around that
+  glide_u = 0.5,        -- in2 glide CV, normalized (0.5 = legacy 0..1 range)
 }
 
 -- runtime -------------------------------------------------------------------
@@ -51,6 +70,9 @@ local gate_hold = 0
 local pitch_seq, pitch_moduli = { 0 }, {}
 local pitch_i = 1
 local pitch_str = 1   -- golden-stride through the members: non-monotonic walk
+local slew_seq, slew_moduli = { 0 }, {}
+local slew_i = 1
+local slew_str = 1
 
 local function gcd(a, b)
   while b ~= 0 do a, b = b, a % b end
@@ -68,7 +90,6 @@ local function clamp01(u) return math.max(0.0, math.min(1.0, u)) end
 -- the crow event queue (REPL dead until power-cycle, 2026-08-14). "Discrete
 -- noise" via raw tick rate is out of reach from Lua — accept the floor.
 local function map_rate(v) return 0.05 * (16.0 / 0.05) ^ clamp01((v + 5) / 10) end
-local function map_cycle(v) return 0.05 * (86400.0 / 0.05) ^ clamp01((v + 5) / 10) end
 
 -- sieve -> member positions over [0, period) --------------------------------
 local function members_of(pairs_, period)
@@ -139,18 +160,29 @@ local function maybe_respan()
   end
 end
 
+-- Shared build for the per-note walked sieves (pitch, slew): sample moduli,
+-- enumerate members over the span, derive a golden-ratio stride coprime to
+-- the count (walking members in order is a monotonic ramp; the stride
+-- visits every member once per cycle in scrambled order instead).
+local function build_walk(p, span, mmax)
+  local moduli = SieveTerms.sample_moduli(p, p.terms, p.seed, mmax)
+  local pairs_ = SieveTerms.residues_for(moduli, p.density, p.conc, p.seed)
+  local seq = members_of(pairs_, span)
+  if #seq == 0 then seq = { 0 } end
+  local m = #seq
+  local str = math.max(1, math.floor(m * 0.618 + 0.5))
+  while m > 1 and gcd(str, m) ~= 1 do str = str + 1 end
+  return seq, str, moduli
+end
+
 local function rebuild_pitch()
-  pitch_moduli = SieveTerms.sample_moduli(S.pitch, S.pitch.terms, S.pitch.seed, 48)
-  local pairs_ = SieveTerms.residues_for(pitch_moduli, S.pitch.density, S.pitch.conc, S.pitch.seed)
-  pitch_seq = members_of(pairs_, S.pitch_span)
-  if #pitch_seq == 0 then pitch_seq = { 0 } end
+  pitch_seq, pitch_str, pitch_moduli = build_walk(S.pitch, S.pitch_span, 48)
   pitch_i = 1
-  -- Walking members in order is a monotonic ramp (volts ascend in the member
-  -- value until the register wraps). A golden-ratio stride coprime to the
-  -- count visits every member once per cycle in scrambled order instead.
-  local m = #pitch_seq
-  pitch_str = math.max(1, math.floor(m * 0.618 + 0.5))
-  while m > 1 and gcd(pitch_str, m) ~= 1 do pitch_str = pitch_str + 1 end
+end
+
+local function rebuild_slew()
+  slew_seq, slew_str, slew_moduli = build_walk(S.slew, S.slew_span, 48)
+  slew_i = 1
 end
 
 -- pitch value -> volts through the current scale -----------------------------
@@ -163,7 +195,17 @@ end
 
 -- ============ control (druid) ==============================================
 function speed_v(v) S.rate = map_rate(v); maybe_respan() end   -- in1 sim
-function cycle_v(v) S.cycle = map_cycle(v); maybe_respan() end -- in2 sim
+-- in2: ONE knob -> BOTH slew params. Time: 0..0.5 raises the ceiling
+-- (max 0->1), 0.5..1 raises the floor too (min 0->1, max 1->2) — stepped ->
+-- sieve's choice -> all-morph. Shape: glide_u centers the palette (see hit
+-- branch). While the CV streams, it owns slew_min/max (slew_range is only
+-- a manual override between samples).
+function glide_v(v)
+  local u = clamp01((v + 5) / 10)
+  S.glide_u = u
+  S.slew_max = 2.0 * u
+  S.slew_min = math.max(0.0, 2.0 * u - 1.0)
+end
 function rate_hz(hz) S.rate = math.max(0.01, math.min(16.0, hz)); respan() end
 function cycle_s(s)  S.cycle = math.max(0.02, s); respan() end
 
@@ -179,18 +221,34 @@ function scale_list() print(Scales.names()) end
 --   pset(...) same keys for the pitch sieve, plus pset('density', .5)
 function dset(k, v) S.dur[k] = v; rebuild_duration() end
 function pset(k, v) S.pitch[k] = v; rebuild_pitch() end
+function sset(k, v) S.slew[k] = v; rebuild_slew() end
 function pitch_span(n) S.pitch_span = math.max(4, math.floor(n)); rebuild_pitch() end
 function registers(n) S.registers = math.max(1, math.floor(n)) end
 function root(v)      S.root = v end
 function gate_ratio(r) S.gate_ratio = math.max(0.05, math.min(1.0, r)) end
+function slew_span(n) S.slew_span = math.max(4, math.floor(n)); rebuild_slew() end
+-- glide-time range as ratios of the note duration (0 = snap; >1 = glides
+-- that outlast their note and get retargeted mid-flight — legato smear)
+function slew_range(lo, hi)
+  S.slew_min = math.max(0.0, lo)
+  S.slew_max = math.max(S.slew_min, hi or S.slew_min)
+end
+-- ORDERED snappy -> smooth (glide CV sweeps through it), e.g.
+-- slew_shapes('logarithmic','linear','sine'); one entry = fixed shape
+function slew_shapes(...)
+  local t = { ... }
+  if #t > 0 then S.slew_shapes = t end
+  print('shapes: ' .. table.concat(S.slew_shapes, ','))
+end
 
 function start()
   stop()
   rebuild_duration()
   rebuild_pitch()
+  rebuild_slew()
   running = true
   input[1].mode('stream', 0.2); input[1].stream = function(v) speed_v(v) end
-  input[2].mode('stream', 0.2); input[2].stream = function(v) cycle_v(v) end
+  input[2].mode('stream', 0.2); input[2].stream = function(v) glide_v(v) end
 
   main_id = clock.run(function()
     while running do
@@ -210,9 +268,22 @@ function start()
       end
       if dhit(dur_step) then
         pitch_i = (pitch_i - 1 + pitch_str) % #pitch_seq + 1
+        local gap = next_gap(dur_step)
+        -- slew sieve: this note's member value sets the glide parameters.
+        -- Time is a ratio of the note's own duration (gap / rate seconds),
+        -- shape indexes the slew_shapes list. Set both BEFORE volts.
+        slew_i = (slew_i - 1 + slew_str) % #slew_seq + 1
+        local sv = slew_seq[slew_i]
+        local u = sv / math.max(1, S.slew_span - 1)
+        -- shape: glide CV centers the ordered palette, sieve jitters +-1
+        local np = #S.slew_shapes
+        local ci = math.floor(S.glide_u * (np - 1) + 0.5) + (sv % 3) - 1
+        if ci < 0 then ci = 0 elseif ci > np - 1 then ci = np - 1 end
+        output[1].shape = S.slew_shapes[ci + 1]
+        output[1].slew = (S.slew_min + (S.slew_max - S.slew_min) * u)
+                         * gap / S.rate
         output[1].volts = pitch_volts(pitch_seq[pitch_i])
         output[2].volts = 5
-        local gap = next_gap(dur_step)
         gate_hold = math.max(1, math.floor(gap * S.gate_ratio + 0.5))
         if gate_hold >= gap and gap > 1 then gate_hold = gap - 1 end
       end
@@ -236,6 +307,7 @@ function stop()
   if main_id then clock.cancel(main_id); main_id = nil end
   if saw_id  then clock.cancel(saw_id);  saw_id  = nil end
   input[1].mode('none'); input[2].mode('none')
+  output[1].slew = 0   -- else the volts=0 below would glide
   for o = 1, 4 do output[o].volts = 0 end
 end
 
@@ -250,6 +322,10 @@ function dump()
     d.center, d.spread, d.n_peaks, d.width, d.dominance, d.terms, d.density, d.conc, d.seed))
   print(string.format('DUMP3 %.3f %.3f %d %.3f %.3f %d %.3f %.3f %.4f',
     p.center, p.spread, p.n_peaks, p.width, p.dominance, p.terms, p.density, p.conc, p.seed))
+  local w = S.slew
+  print(string.format('DUMP4 %.3f %.3f %d %.3f %.3f %d %.3f %.3f %.4f %d %.3f %.3f %s',
+    w.center, w.spread, w.n_peaks, w.width, w.dominance, w.terms, w.density, w.conc, w.seed,
+    S.slew_span, S.slew_min, S.slew_max, table.concat(S.slew_shapes, ',')))
 end
 
 function status()
@@ -259,6 +335,9 @@ function status()
                       dur_span, table.concat(dur_moduli, ','), #dur_pairs))
   print(string.format('pitch: span=%d mod={%s} n=%d reg=%d',
                       S.pitch_span, table.concat(pitch_moduli, ','), #pitch_seq, S.registers))
+  print(string.format('slew : span=%d mod={%s} n=%d glide=%.2f ratio=%.2f..%.2f shapes=%s',
+                      S.slew_span, table.concat(slew_moduli, ','), #slew_seq,
+                      S.glide_u, S.slew_min, S.slew_max, table.concat(S.slew_shapes, ',')))
   print(string.format('pos  : step=%d pitch_i=%d saw=%.3f gate=%.2f',
                       dur_step, pitch_i, saw_phase, S.gate_ratio))
 end
@@ -266,5 +345,10 @@ end
 function init()
   input[1].mode('none'); input[2].mode('none')
   for o = 1, 4 do output[o].volts = 0 end
-  print('sieve_dual: idle. scale_list(); scale("harm32"); start()')
+  -- auto-start on boot so the rack runs standalone (no host needed).
+  -- deliberate exception to the no-auto-start rule: if this script ever
+  -- misbehaves at boot, recovery is the i2c-jumper procedure, not a
+  -- plain power-cycle. stop() from druid returns it to idle.
+  clock.run(function() clock.sleep(1.0); start() end)
+  print('sieve_dual: auto-starting in 1s. stop() to idle')
 end
